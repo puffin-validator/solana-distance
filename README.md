@@ -1,8 +1,8 @@
 # solana-distance
 
-`solana-distance` is command-line tool to measure the distance in µs to the whole Solana cluster or to specific validators.
+`solana-distance` is command-line tool designed to measure the distance in microseconds (µs) to the entire Solana cluster or to specific validators.
 
-Instead of using ICMP ECHO (ping), which are often blocked or traffic-shaped by network configurations, it opens QUIC connections to validators TPU and measure the RTT during connection handshake.
+Instead of relaying on ICMP ECHO (ping), which is often blocked or traffic-shaped by network configurations, it establishes QUIC connections to validators' TPU and measures the round-trip time (RTT) during the connection handshake.
 
 
 ## Installation
@@ -24,7 +24,8 @@ Instead of using ICMP ECHO (ping), which are often blocked or traffic-shaped by 
 The resulting binary will be located in `target/release/solana-distance`.
 
 ## Usage
-Without any argument, the result is printed, after about 10 seconds. The most important reported value is the stake-weighed average distance. Please note that this is a network latency, and is comparable with half of an RTT, as reported by the `ping` command.  
+When run without arguments, the tool measures the distance to the entire Solana cluster and displays results after approximately 10 seconds. The most important metric reported is the stake-weighted average distance, which represents network latency and is comparable to half of the RTT reported by the `ping` command.
+
 ```console
 $ solana-distance
 Simple distance: 23019 µs
@@ -35,7 +36,7 @@ No contact info: 1 (0.01% of total stake)
 Connection failed: 3 (0.10% of total stake)
 ```
 
-To measure the distance to one or several specific validators, provide their identity or the adress and port of their TPU:
+To measure the distance to one or more specific validators, provide their identity or the address and port of their TPU:
 ```console
 $ solana-distance puffinQSvKFriPbyE5atyx1ptfnyytovbzxybr1jsyy 64.130.57.131:8009
 Simple distance: 539 µs
@@ -44,9 +45,9 @@ Stake-weighted distance: 500 µs
 Total stake: 13493788 SOL
 ```
 
-This can be useful to measure the distance to a subset of validators, for instance to assess the impact of DoubleZero:
+This feature is particularly useful for measuring the distance to a subset of validators, like DoubleZero-connected nodes:
 ```shell
 solana-distance `doublezero user list|grep -oP 'SolanaValidator: \(\K\w+'`
 ```
 
-Other options are listed with the `--help` flag
+For a full list of available options, use the `--help` flag.

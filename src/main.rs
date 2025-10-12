@@ -82,11 +82,8 @@ const CONNECTION_TIMEOUT: Duration = LEADER_WINDOW;
 async fn rtt(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> u128 {
     let server_name = socket_addr_to_quic_server_name(tpu_quic);
     if temporization {
-        let t = {
-            let mut rng = rand::rng();
-            rng.random_range(Duration::ZERO..LEADER_WINDOW)
-        };
-        sleep(t).await;
+        let delay= rand::rng().random_range(Duration::ZERO..LEADER_WINDOW);
+        sleep(delay).await;
     }
     let mut t = tokio::time::Instant::now();
     let mut rtt_min = ping(&endpoint, &server_name, tpu_quic).await;

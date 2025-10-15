@@ -15,6 +15,8 @@ use std::net::SocketAddr;
 use std::ops::Add;
 use std::path::PathBuf;
 use std::time::Duration;
+use reqwest::blocking::Response;
+use serde_json::Value;
 use tokio::fs::File;
 use tokio::io;
 use tokio::io::AsyncBufReadExt;
@@ -22,9 +24,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, timeout};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Measure the distance in µm to the Solana cluster or to individual validators")]
+#[command(version, about = "Measure the distance in µm to the Solana cluster, to Doublezero, or to individual validators")]
 struct Args {
-    #[arg(help = "Optional list of validator pubkey or TPU ip:port")]
+    #[arg(help = "Optional list of validator pubkey or TPU ip:port, or a Doublezero network name if option -2 is specified",)]
     destination: Vec<String>,
     #[arg(short, long, help = "Print details for each validator we are connecting to")]
     details: bool,
@@ -36,6 +38,8 @@ struct Args {
     count: usize,
     #[arg(short, long, help = "URL of the RPC where cluster info is fetched from", default_value="https://api.mainnet-beta.solana.com")]
     rpc: String,
+    #[arg(short='2', long, help = "Measure the distance to the a Doublezero network passed as an optional argument [default: mainnet]")]
+    doublezero: bool,
 }
 
 struct TPU {
@@ -106,6 +110,23 @@ async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -
     }
 }
 
+fn decode_doublezero_info(dz_info: Response) -> Result<Vec<String>, &'static str> {
+    let Ok(j) = dz_info.json::<Value>() else { return Err("Invalid JSON") };
+    let Some(j) = j.as_object() else { return Err("Not an object") };
+    if j.get("success") != Some(&Value::Bool(true)) { return Err("Failed") };
+    let Some(j) = j.get("data") else { return Err("No data") };
+    let Some(j) = j.as_object() else { return Err("data is not an object") };
+    let Some(j) = j.get("validators") else { return Err("No validators") };
+    let Some(j) = j.as_array() else { return Err("validators is not an array") };
+    let mut res = Vec::new();
+    for v in j {
+        let Some(j) = v.as_object() else { return Err("validators is not an array of objects") };
+        let Some(j) = j.get("account") else { return Err("validator has no account") };
+        res.push(j.as_str().unwrap().to_string());
+    }
+    if res.is_empty() { return Err("No validators") };
+    Ok(res)
+}
 
 #[tokio::main]
 async fn main() {
@@ -114,21 +135,31 @@ async fn main() {
 
     let rpc_client = RpcClient::new(args.rpc);
 
-    let mut nodes_str = args.destination;
+    let mut destination = args.destination;
 
     if let Some(path) = args.file {
         let file = File::open(path).await.expect("Failed to open specified file");
         let mut lines = io::BufReader::new(file).lines();
         while let Some(line) = lines.next_line().await.expect("Failed to read specified file") {
-            nodes_str.push(line);
+            destination.push(line);
         }
     }
 
-    let nodes_cnt = nodes_str.len();
+    if args.doublezero {
+        let network = destination.pop().unwrap_or("mainnet".to_string());
+        if !destination.is_empty() {
+            panic!("Only one Doublezero network name can be specified");
+        }
+        let url = format!("https://doublezero.xyz/api/dz-validators?network={}", network);
+        let dz_info = reqwest::blocking::get(&url).expect("Cannot send request to Doublezero API");
+        destination = decode_doublezero_info(dz_info).unwrap_or_else(|e| panic!("Failed to decode Doublezero API response: {}", e));
+    }
+
+    let nodes_cnt = destination.len();
     let mut nodes_pk = Vec::new();
     let mut nodes_sa = Vec::new();
 
-    for str in nodes_str.into_iter() {
+    for str in destination.into_iter() {
         match str.parse::<SocketAddr>() {
             Ok(sock_addr) => {
                 nodes_sa.push(sock_addr);

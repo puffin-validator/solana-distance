@@ -45,9 +45,6 @@ Stake-weighted distance: 500 µs
 Total stake: 13493788 SOL
 ```
 
-This feature is particularly useful for measuring the distance to a subset of validators, like DoubleZero-connected nodes:
-```shell
-solana-distance `doublezero user list|grep -oP 'SolanaValidator: \(\K\w+'`
-```
+Option `--doublezero` limits the measure to validators connected to Doublezero and is a good way to quantify the impact of being connected to Doublezero.
 
 For a full list of available options, use the `--help` flag.

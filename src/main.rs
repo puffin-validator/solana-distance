@@ -1,7 +1,7 @@
 mod quic;
 
 use crate::quic::{new_quic_endpoint, socket_addr_to_quic_server_name};
-use crate::Error::{ConnectionError, ConnectionFailed, NoContactInfo, NoTPU, NotAStakedNode};
+use crate::Error::{ConnectionError, ConnectionFailed, NoContactInfo, NoTPU, NotAStakedNode, OnlyOneSuccessfulConnection};
 use clap::Parser;
 use quinn::{Endpoint, VarInt};
 use rand::Rng;
@@ -44,13 +44,14 @@ struct Args {
 
 struct TPU {
     stake: u64,
-    join: Option<JoinHandle<u128>>,
+    join: Option<JoinHandle<(u32, u64)>>,
     ids: Vec<String>,
 }
 
 #[derive(Eq, Hash, PartialEq)]
 enum Error {
     ConnectionFailed,
+    OnlyOneSuccessfulConnection,
     ConnectionError,
     NoContactInfo,
     NoTPU,
@@ -63,12 +64,17 @@ impl Errors {
         e.0 += 1;
         e.1 += stake;
     }
+    fn new_and_print_if(&mut self, error: Error, stake: u64, print: bool) {
+        if print { println!("{}", error) }
+        self.new(error, stake);
+    }
 }
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             ConnectionError => write!(f, "Connection error"),
-            ConnectionFailed => write!(f, "Connection failed"),
+            ConnectionFailed => write!(f, "No successful connection"),
+            OnlyOneSuccessfulConnection => write!(f, "Only one successful connection"),
             NoContactInfo => write!(f, "No contact info"),
             NoTPU => write!(f, "No TPU"),
             NotAStakedNode => write!(f, "Not a staked node"),
@@ -79,34 +85,65 @@ impl Display for Error {
 const LEADER_WINDOW: Duration = Duration::from_millis(4 * 400); // 4 slots
 const CONNECTION_TIMEOUT: Duration = LEADER_WINDOW;
 
+/// Return latency estimate and its variance.
+///
 /// Send `count` connection requests, spaced 4 slots apart, to give a good chance that at least one request
 /// doesn't arrive when the validator is busy being leader.
-/// Take the minimum delay.
 /// Add a random temporization if requested.
-async fn rtt(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> u128 {
+///
+/// We collect latencies and assume they follow a 2-parameter exponential distribution:
+/// p(x) = 1/b exp(-(x-a)/b)
+/// Parameters are estimated using unbiased MLE:
+/// https://www.researchgate.net/publication/233060006_Estimation_in_two-parameter_exponential_distributions
+/// a = (n*min(x) - mean(x))/(n-1)
+/// b = n*(mean(x) - min(x))/(n-1)
+/// var(a) = b^2 / (n(n-1))
+async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> (u32, u64) {
     let server_name = socket_addr_to_quic_server_name(tpu_quic);
     if temporization {
         let delay= rand::rng().random_range(Duration::ZERO..LEADER_WINDOW);
         sleep(delay).await;
     }
     let mut t = tokio::time::Instant::now();
-    let mut rtt_min = ping(&endpoint, &server_name, tpu_quic).await;
+    let mut lat_min = ping(&endpoint, &server_name, tpu_quic).await;
+    let mut lat_sum;
+    let mut lat_cnt;
+    if lat_min == u32::MAX {
+        lat_cnt = 0;
+        lat_sum = 0;
+    } else {
+        lat_cnt = 1;
+        lat_sum = lat_min as u64;
+    }
     for _ in 1..count {
         t = t.add(LEADER_WINDOW);
         sleep_until(t).await;
-        rtt_min = rtt_min.min(ping(&endpoint, &server_name, tpu_quic).await);
+        let lat = ping(&endpoint, &server_name, tpu_quic).await;
+        if lat != u32::MAX {
+            lat_min = lat_min.min(lat);
+            lat_sum += lat as u64;
+            lat_cnt += 1;
+        }
     }
-    rtt_min
+    if lat_cnt < 2 {
+        (lat_min, u64::MAX)
+    } else {
+        let lat_mean = lat_sum / lat_cnt;
+        let a = (lat_cnt * lat_min as u64 - lat_mean) / (lat_cnt - 1);
+        let b = (lat_cnt * (lat_mean - lat_min as u64)) / (lat_cnt - 1);
+        (a.try_into().expect("rtt overflow"), (b*b)/(lat_cnt*(lat_cnt-1)))
+    }
 }
 
-async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -> u128 {
+async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -> u32 {
     let connecting = endpoint.connect(tpu_quic, server_name).expect("Connection configuration error");
     if let Ok(Ok(connection)) = timeout(CONNECTION_TIMEOUT, connecting).await {
-        let rtt = connection.rtt().as_micros();
+        // With a timeout of 2 s, rtt in µs should never overflow u32.
+        let rtt: u32 = connection.rtt().as_micros().try_into().expect("rtt overflow");
         connection.close(VarInt::default(), &[]);
-        rtt
+        rtt/2
     } else {
-        u128::MAX
+        u32::MAX
     }
 }
 
@@ -329,45 +366,63 @@ async fn main() {
 
     let temporization = tpus.len() > 1;
     for (sock_addr, tpu) in &mut tpus {
-        tpu.join = Some(tokio::spawn(rtt(endpoint.clone(), *sock_addr, args.count, temporization)));
+        tpu.join = Some(tokio::spawn(latency(endpoint.clone(), *sock_addr, args.count, temporization)));
     }
 
-    let mut distance_sum_w = 0;
-    let mut distance_sum = 0;
-    let mut distance_cnt = 0;
-    let mut distance_stk = 0;
+    let mut lat_sum_w = 0;
+    let mut lat_sum = 0;
+    let mut lat_cnt = 0;
+    let mut lat_stk = 0;
+
+    let mut var_sum_w = 0;
+    let mut var_sum = 0;
 
     for (sock_addr, tpu) in tpus {
         match tpu.join {
             Some(join) => {
                 if args.details {
                     if total_stake > 0 {
-                        print!("{:21} {:>9} SOL {:?}", sock_addr, tpu.stake / 1_000_000_000, tpu.ids);
+                        print!("{:21} {:>9} SOL {:?} ", sock_addr, tpu.stake / 1_000_000_000, tpu.ids);
                     } else {
-                        print!("{:21} {:?}", sock_addr, tpu.ids);
+                        print!("{:21} {:?} ", sock_addr, tpu.ids);
                     }
                 }
                 match join.await {
-                    Ok(u128::MAX) => {
-                        errors.new(ConnectionFailed, tpu.stake);
-                        if args.details {
-                            println!(" Failed");
+                    Ok((u32::MAX, _)) => {
+                        errors.new_and_print_if(ConnectionFailed, tpu.stake, args.details);
+                    }
+                    Ok((lat, u64::MAX)) => {
+                        // Ignore this measure if args.count > 1 since we won't be able to
+                        // compute global variance
+                        if args.count == 1 {
+                            if total_stake > 0 {
+                                lat_sum_w += lat as u128 * tpu.stake as u128;
+                                lat_stk += tpu.stake;
+                            }
+                            lat_sum += lat as u64;
+                            lat_cnt += 1;
+                            if args.details {
+                                println!("{} µs", lat);
+                            }
+                        } else {
+                            errors.new_and_print_if(OnlyOneSuccessfulConnection, tpu.stake, args.details);
                         }
                     }
-                    Ok(rtt) => {
-                        let distance = rtt/2;
+                    Ok((lat, var)) => {
                         if total_stake > 0 {
-                            distance_sum_w += distance * tpu.stake as u128;
-                            distance_stk += tpu.stake;
+                            lat_sum_w += lat as u128 * tpu.stake as u128;
+                            lat_stk += tpu.stake;
+                            var_sum_w += var as u128 * tpu.stake as u128;
                         }
-                        distance_sum += distance;
-                        distance_cnt += 1;
+                        lat_sum += lat as u64;
+                        lat_cnt += 1;
+                        var_sum += var as u128;
                         if args.details {
-                            println!(" {} µs", distance);
+                            println!("{} µs ± {} µs", lat, var.isqrt());
                         }
                     }
                     Err(_) => {
-                        errors.new(ConnectionError, tpu.stake);
+                        errors.new_and_print_if(ConnectionError, tpu.stake, args.details);
                     }
                 }
             }
@@ -376,13 +431,21 @@ async fn main() {
         }
     }
 
-    if distance_cnt > 0 {
-        println!("Simple distance: {} µs", distance_sum / distance_cnt as u128);
-        println!("Connection successful: {}", distance_cnt);
-        if total_stake > 0 {
-            println!("Stake-weighted distance: {} µs", distance_sum_w / distance_stk as u128);
-            println!("Total stake: {} SOL", distance_stk / 1_000_000_000);
+    if lat_cnt > 0 {
+        if args.count > 1 {
+            println!("Simple distance: {} ± {} µs", lat_sum / lat_cnt as u64, (var_sum / lat_cnt).isqrt());
+        } else {
+            println!("Simple distance: {} µs", lat_sum / lat_cnt as u64);
         }
+        if total_stake > 0 {
+            if args.count > 1 {
+                println!("Stake-weighted distance: {} ± {} µs", lat_sum_w / lat_stk as u128, (var_sum_w / lat_stk as u128).isqrt());
+            } else {
+                println!("Stake-weighted distance: {} µs", lat_sum_w / lat_stk as u128);
+            }
+            println!("Total stake: {} SOL", lat_stk / 1_000_000_000);
+        }
+        println!("Connection successful: {}", lat_cnt);
     }
 
     for (error, (cnt, stk)) in &errors.0 {

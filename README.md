@@ -24,24 +24,26 @@ Instead of relaying on ICMP ECHO (ping), which is often blocked or traffic-shape
 The resulting binary will be located in `target/release/solana-distance`.
 
 ## Usage
-When run without arguments, the tool measures the distance to the entire Solana cluster and displays results after approximately 10 seconds. The most important metric reported is the stake-weighted average distance, which represents network latency and is comparable to half of the RTT reported by the `ping` command.
+When run without arguments, the tool measures the distance to the entire Solana cluster and displays results after approximately 10 seconds. The most important metric reported is the stake-weighted average distance, which represents network latency and is comparable to half of an RTT as reported by the `ping` command.
 
 ```console
 $ solana-distance
-Simple distance: 23019 µs
-Connection successful: 948
-Stake-weighted distance: 20668 µs
-Total stake: 410686394 SOL
+Simple distance: 27379 ± 187 µs
+Stake-weighted distance: 22302 ± 127 µs
+Total stake: 407733562 SOL
+Connection successful: 875
 No contact info: 1 (0.01% of total stake)
 Connection failed: 3 (0.10% of total stake)
 ```
 
+The reported uncertainty, for a fixed number of connection attempts (see `--count` option), can be used as a measure of jitter.
+
 To measure the distance to one or more specific validators, provide their identity or the address and port of their TPU:
 ```console
 $ solana-distance puffinQSvKFriPbyE5atyx1ptfnyytovbzxybr1jsyy 64.130.57.131:8009
-Simple distance: 539 µs
+Simple distance: 539 ± 11 µs
+Stake-weighted distance: 500 ± 10 µs
 Connection successful: 2
-Stake-weighted distance: 500 µs
 Total stake: 13493788 SOL
 ```
 

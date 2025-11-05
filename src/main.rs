@@ -418,7 +418,7 @@ async fn main() {
                         lat_cnt += 1;
                         var_sum += var as u128;
                         if args.details {
-                            println!("{} µs ± {} µs", lat, var.isqrt());
+                            println!("{} ± {} µs", lat, var.isqrt());
                         }
                     }
                     Err(_) => {

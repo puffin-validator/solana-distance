@@ -129,7 +129,7 @@ async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, tempori
         (lat_min, u64::MAX)
     } else {
         let lat_mean = lat_sum / lat_cnt;
-        let a = (lat_cnt * lat_min as u64 - lat_mean) / (lat_cnt - 1);
+        let a = ((lat_cnt * lat_min as u64).saturating_sub(lat_mean)) / (lat_cnt - 1);
         let b = (lat_cnt * (lat_mean - lat_min as u64)) / (lat_cnt - 1);
         (a.try_into().expect("rtt overflow"), (b*b)/(lat_cnt*(lat_cnt-1)))
     }

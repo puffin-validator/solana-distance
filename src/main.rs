@@ -57,7 +57,7 @@ fn parse_count(s: &str) -> Result<usize, String> {
 
 struct TPU {
     stake: u64,
-    join: Option<JoinHandle<Option<(f64, Option<f64>)>>>,
+    join: Option<JoinHandle<Vec<u32>>>,
     ids: Vec<String>,
 }
 
@@ -103,26 +103,12 @@ const DEFAULT_SOURCE_PORT: u16 = 20488;
 const LEADER_WINDOW: Duration = Duration::from_millis(4 * 200); // 4 slots
 const CONNECTION_TIMEOUT: Duration = Duration::from_millis(1600); // Quinn retransmission fires after 1s, so we need the timeout to be greater than 1s + highest RTT
 
-/// Return latency estimate and its variance, or `None` if no connection succeeded.
-/// The variance is `None` if only one connection succeeded.
+/// Return the sorted latencies of successful connections.
 ///
 /// Send `count` connection requests, spaced 4 slots apart, to give a good chance that at least one request
 /// doesn't arrive when the validator is busy being leader.
 /// Add a random temporization if requested.
-///
-/// We collect latencies and assume they follow a 2-parameter exponential distribution:
-/// p(x) = 1/b exp(-(x-a)/b)
-/// To be robust against outliers (e.g. the validator being busy), only the r = ceil(n/2) lowest of the
-/// n latencies are used (at least 2), the others being treated as censored (type II censoring): all we
-/// retain from them is that they are not lower than the highest latency kept.
-/// With x(1) <= ... <= x(n) the sorted latencies, the unbiased estimators are:
-/// b = (x(1) + ... + x(r) + (n-r)*x(r) - n*x(1)) / (r-1)
-/// a = x(1) - b/n
-/// var(a) = b^2 / n^2
-/// With r = n, these are the usual unbiased estimators for the complete sample:
-/// https://www.researchgate.net/publication/233060006_Estimation_in_two-parameter_exponential_distributions
-/// Note that `a` can be negative when the latencies are widely spread compared to the lowest one.
-async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> Option<(f64, Option<f64>)> {
+async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> Vec<u32> {
     let server_name = socket_addr_to_quic_server_name(tpu_quic);
     if temporization {
         let delay= rand::rng().random_range(Duration::ZERO..LEADER_WINDOW);
@@ -137,10 +123,24 @@ async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, tempori
         lats.extend(ping(&endpoint, &server_name, tpu_quic).await);
     }
     lats.sort_unstable();
-    estimate_latency(&lats)
+    lats
 }
 
-/// Estimate the latency and its variance from sorted latencies, see `latency`.
+/// Return latency estimate and its variance from sorted latencies, or `None` if there is no latency.
+/// The variance is `None` if there is only one latency.
+///
+/// We assume latencies follow a 2-parameter exponential distribution:
+/// p(x) = 1/b exp(-(x-a)/b)
+/// To be robust against outliers (e.g. the validator being busy), only the r = ceil(n/2) lowest of the
+/// n latencies are used (at least 2), the others being treated as censored (type II censoring): all we
+/// retain from them is that they are not lower than the highest latency kept.
+/// With x(1) <= ... <= x(n) the sorted latencies, the unbiased estimators are:
+/// b = (x(1) + ... + x(r) + (n-r)*x(r) - n*x(1)) / (r-1)
+/// a = x(1) - b/n
+/// var(a) = b^2 / n^2
+/// With r = n, these are the usual unbiased estimators for the complete sample:
+/// https://www.researchgate.net/publication/233060006_Estimation_in_two-parameter_exponential_distributions
+/// Note that `a` can be negative when the latencies are widely spread compared to the lowest one.
 fn estimate_latency(lats: &[u32]) -> Option<(f64, Option<f64>)> {
     let n = lats.len();
     if n < 2 {
@@ -155,6 +155,17 @@ fn estimate_latency(lats: &[u32]) -> Option<(f64, Option<f64>)> {
     let b = excess as f64 / (r - 1) as f64;
     let a = lat_min as f64 - b / n as f64;
     Some((a, Some((b * b) / (n * n) as f64)))
+}
+
+/// Return the weighted median of the first elements of `sorted`, which must be sorted.
+/// The weight of an element is given by `weight` applied to its second element.
+fn weighted_median(sorted: &[(u32, u32)], weight: impl Fn(u32) -> f64) -> Option<u32> {
+    let total: f64 = sorted.iter().map(|&(_, i)| weight(i)).sum();
+    let mut sum = 0.0;
+    sorted.iter().find(|&&(_, i)| {
+        sum += weight(i);
+        sum >= total / 2.0
+    }).map(|&(value, _)| value)
 }
 
 async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -> Option<u32> {
@@ -401,6 +412,13 @@ async fn main() {
     let mut var_sum_w = 0.0;
     let mut var_sum = 0.0;
 
+    // Jitter is the median of the absolute differences between two latencies of the same TPU, over
+    // all the pairs of latencies of all TPUs. Being a difference, it doesn't depend on the latency
+    // estimate, and being a median, it is robust against outliers.
+    // Pairs are weighted so that the weight of a TPU doesn't depend on its number of pairs.
+    let mut jit_diffs: Vec<(u32, u32)> = Vec::new(); // (difference, index of the TPU in `jit_weights`)
+    let mut jit_weights: Vec<(f64, f64)> = Vec::new(); // weight of each pair of a TPU: (simple, stake-weighted)
+
     for (sock_addr, tpu) in tpus {
         match tpu.join {
             Some(join) => {
@@ -411,11 +429,11 @@ async fn main() {
                         print!("{:21} {:?} ", sock_addr, tpu.ids);
                     }
                 }
-                match join.await {
-                    Ok(None) => {
+                match join.await.map(|lats| (estimate_latency(&lats), lats)) {
+                    Ok((None, _)) => {
                         errors.new_and_print_if(ConnectionFailed, tpu.stake, args.details);
                     }
-                    Ok(Some((lat, None))) => {
+                    Ok((Some((lat, None)), _)) => {
                         // Ignore this measure if args.count > 1 since we won't be able to
                         // compute global variance
                         if args.count == 1 {
@@ -432,7 +450,14 @@ async fn main() {
                             errors.new_and_print_if(OnlyOneSuccessfulConnection, tpu.stake, args.details);
                         }
                     }
-                    Ok(Some((lat, Some(var)))) => {
+                    Ok((Some((lat, Some(var))), lats)) => {
+                        let pairs_cnt = (lats.len() * (lats.len() - 1) / 2) as f64;
+                        let tpu_idx = jit_weights.len() as u32;
+                        jit_weights.push((1.0 / pairs_cnt, tpu.stake as f64 / pairs_cnt));
+                        for (i, lat_i) in lats.iter().enumerate() {
+                            // Latencies are sorted
+                            jit_diffs.extend(lats[i + 1..].iter().map(|lat_j| (lat_j - lat_i, tpu_idx)));
+                        }
                         if total_stake > 0 {
                             lat_sum_w += lat * tpu.stake as f64;
                             lat_stk += tpu.stake;
@@ -456,15 +481,23 @@ async fn main() {
         }
     }
 
+    jit_diffs.sort_unstable();
+
     if lat_cnt > 0 {
         if args.count > 1 {
             println!("Simple distance: {:.0} ± {:.0} µs", lat_sum / lat_cnt as f64, var_sum.sqrt() / lat_cnt as f64);
+            if let Some(jitter) = weighted_median(&jit_diffs, |i| jit_weights[i as usize].0) {
+                println!("Simple jitter: {} µs", jitter);
+            }
         } else {
             println!("Simple distance: {:.0} µs", lat_sum / lat_cnt as f64);
         }
         if lat_stk > 0 {
             if args.count > 1 {
                 println!("Stake-weighted distance: {:.0} ± {:.0} µs", lat_sum_w / lat_stk as f64, var_sum_w.sqrt() / lat_stk as f64);
+                if let Some(jitter) = weighted_median(&jit_diffs, |i| jit_weights[i as usize].1) {
+                    println!("Stake-weighted jitter: {} µs", jitter);
+                }
             } else {
                 println!("Stake-weighted distance: {:.0} µs", lat_sum_w / lat_stk as f64);
             }

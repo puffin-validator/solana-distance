@@ -36,7 +36,7 @@ No contact info: 1 (0.01% of total stake)
 Connection failed: 3 (0.10% of total stake)
 ```
 
-The reported uncertainty, for a fixed number of connection attempts (see `--count` option), can be used as a measure of jitter.
+The reported uncertainty is the standard error of the distance. Jitter is reported separately, when more than one connection attempt is made (see `--count` option): it is the median difference between two latencies measured to the same validator, which makes it insensitive to occasional slow responses.
 
 To measure the distance to one or more specific validators, provide their identity or the address and port of their TPU:
 ```console

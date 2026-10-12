@@ -21,7 +21,7 @@ use tokio::fs::File;
 use tokio::io;
 use tokio::io::AsyncBufReadExt;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, sleep_until, timeout};
+use tokio::time::{sleep, sleep_until, timeout, Instant};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Measure the distance in µm to the Solana cluster, to Doublezero, or to individual validators")]
@@ -117,11 +117,11 @@ async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, tempori
         let delay= rand::rng().random_range(Duration::ZERO..LEADER_WINDOW);
         sleep(delay).await;
     }
-    let mut t = tokio::time::Instant::now();
+    let mut t = Instant::now();
     let mut lats = Vec::with_capacity(count);
     lats.extend(ping(&endpoint, &server_name, tpu_quic).await);
     for _ in 1..count {
-        t = t.add(LEADER_WINDOW);
+        t = t.add(LEADER_WINDOW).max(Instant::now());
         sleep_until(t).await;
         lats.extend(ping(&endpoint, &server_name, tpu_quic).await);
     }

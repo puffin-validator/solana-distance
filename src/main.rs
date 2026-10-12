@@ -385,6 +385,8 @@ async fn main() {
     let mut lat_cnt = 0;
     let mut lat_stk = 0;
 
+    // Latency estimates are independent, so the variance of their weighted mean is
+    // sum(w_i^2 * var_i) / sum(w_i)^2
     let mut var_sum_w = 0.0;
     let mut var_sum = 0.0;
 
@@ -423,7 +425,7 @@ async fn main() {
                         if total_stake > 0 {
                             lat_sum_w += lat * tpu.stake as f64;
                             lat_stk += tpu.stake;
-                            var_sum_w += var * tpu.stake as f64;
+                            var_sum_w += var * (tpu.stake as f64).powi(2);
                         }
                         lat_sum += lat;
                         lat_cnt += 1;
@@ -445,13 +447,13 @@ async fn main() {
 
     if lat_cnt > 0 {
         if args.count > 1 {
-            println!("Simple distance: {:.0} ± {:.0} µs", lat_sum / lat_cnt as f64, (var_sum / lat_cnt as f64).sqrt());
+            println!("Simple distance: {:.0} ± {:.0} µs", lat_sum / lat_cnt as f64, var_sum.sqrt() / lat_cnt as f64);
         } else {
             println!("Simple distance: {:.0} µs", lat_sum / lat_cnt as f64);
         }
         if total_stake > 0 {
             if args.count > 1 {
-                println!("Stake-weighted distance: {:.0} ± {:.0} µs", lat_sum_w / lat_stk as f64, (var_sum_w / lat_stk as f64).sqrt());
+                println!("Stake-weighted distance: {:.0} ± {:.0} µs", lat_sum_w / lat_stk as f64, var_sum_w.sqrt() / lat_stk as f64);
             } else {
                 println!("Stake-weighted distance: {:.0} µs", lat_sum_w / lat_stk as f64);
             }

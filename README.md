@@ -38,14 +38,16 @@ Connection failed: 3 (0.10% of total stake)
 
 The reported uncertainty is the standard error of the distance. Jitter is reported separately, when more than one connection attempt is made (see `--count` option): it is the median difference between two latencies measured to the same validator, which makes it insensitive to occasional slow responses.
 
-To measure the distance to one or more specific validators, provide their identity or the address and port of their TPU:
+To measure the distance to one or more specific validators, provide their identity, their name or the address and port of their TPU:
 ```console
-$ solana-distance puffinQSvKFriPbyE5atyx1ptfnyytovbzxybr1jsyy 64.130.57.131:8009
+$ solana-distance puffinQSvKFriPbyE5atyx1ptfnyytovbzxybr1jsyy 64.130.57.131:8009 Pebble
 Simple distance: 539 ± 11 µs
 Stake-weighted distance: 500 ± 10 µs
 Connection successful: 2
 Total stake: 13493788 SOL
 ```
+
+Names are those published on chain by validators (see `solana validator-info`), limited to nodes of the cluster. Case is ignored, and a name ending with `*` matches names starting with what precedes. The command fails if several validators match a name.
 
 Option `--doublezero` limits the measure to validators connected to Doublezero and is a good way to quantify the impact of being connected to Doublezero.
 

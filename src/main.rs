@@ -1,12 +1,13 @@
 mod quic;
 
 use crate::quic::{new_quic_endpoint, socket_addr_to_quic_server_name};
-use crate::Error::{ConnectionError, ConnectionFailed, NoContactInfo, NoTPU, NotAStakedNode, OnlyOneSuccessfulConnection};
+use crate::Error::{ConnectionError, ConnectionFailed, NoContactInfo, NoTPU, NotAStakedNode, OnlyOneSuccessfulConnection, UnknownName};
 use clap::Parser;
 use quinn::{Endpoint, VarInt};
 use rand::Rng;
-use solana_keypair::Keypair;
+use solana_keypair::{Address, Keypair};
 use solana_rpc_client::rpc_client::RpcClient;
+use solana_rpc_client_types::request::RpcRequest;
 use solana_rpc_client_types::response::RpcContactInfo;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -16,7 +17,7 @@ use std::ops::Add;
 use std::path::PathBuf;
 use std::time::Duration;
 use reqwest::Response;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::fs::File;
 use tokio::io;
 use tokio::io::AsyncBufReadExt;
@@ -26,11 +27,11 @@ use tokio::time::{sleep, sleep_until, timeout, Instant};
 #[derive(Parser, Debug)]
 #[command(version, about = "Measure the distance in µm to the Solana cluster, to Doublezero, or to individual validators")]
 struct Args {
-    #[arg(help = "Optional list of validator pubkey or TPU ip:port, or a Doublezero network name if option -2 is specified",)]
+    #[arg(help = "Optional list of validator pubkey, name or TPU ip:port, or a Doublezero network name if option -2 is specified. A name ending with * matches names starting with what precedes",)]
     destination: Vec<String>,
     #[arg(short, long, help = "Print details for each validator we are connecting to")]
     details: bool,
-    #[arg(short, long, help = "Path to a file containing a list of validator pubkey or ip:port")]
+    #[arg(short, long, help = "Path to a file containing a list of validator pubkey, name or ip:port")]
     file: Option<PathBuf>,
     #[arg(short='s', long, help = "If specified, disable the stake-weighting of the average distance")]
     no_stake_weighting: bool,
@@ -70,6 +71,7 @@ enum Error {
     NoContactInfo,
     NoTPU,
     NotAStakedNode,
+    UnknownName,
 }
 struct Errors(HashMap<Error, (u64, u64)>);
 impl Errors {
@@ -92,6 +94,7 @@ impl Display for Error {
             NoContactInfo => write!(f, "No contact info"),
             NoTPU => write!(f, "No TPU"),
             NotAStakedNode => write!(f, "Not a staked node"),
+            UnknownName => write!(f, "Unknown name"),
         }
     }
 }
@@ -199,6 +202,42 @@ async fn decode_doublezero_info(dz_info: Response) -> Result<Vec<String>, &'stat
     Ok(res)
 }
 
+const CONFIG_PROGRAM_ID: &str = "Config1111111111111111111111111111111111111";
+
+/// Return the name and the identity of the validators which published their info on chain.
+fn get_validator_names(rpc_client: &RpcClient) -> Vec<(String, String)> {
+    let accounts: Vec<Value> = rpc_client
+        .send(RpcRequest::GetProgramAccounts, json!([CONFIG_PROGRAM_ID, {"encoding": "jsonParsed"}]))
+        .expect("Failed to get validators info");
+    accounts.iter().filter_map(|account| {
+        let parsed = &account["account"]["data"]["parsed"];
+        if parsed["type"] != "validatorInfo" { return None };
+        // Info is signed by the identity of the validator
+        let identity = parsed["info"]["keys"].as_array()?.iter().find(|key| key["signer"] == true)?;
+        let name = parsed["info"]["configData"]["name"].as_str()?.trim();
+        Some((name.to_string(), identity["pubkey"].as_str()?.to_string()))
+    }).collect()
+}
+
+/// Return the identity of the validator matching `name`, ignoring case, or all the matching
+/// (name, identity) pairs if there are several ones.
+/// If `name` ends with `*`, it matches names starting with what precedes.
+fn find_validator<'a>(name: &str, validator_names: &'a [(String, String)]) -> Result<Option<&'a str>, Vec<&'a (String, String)>> {
+    let name = name.trim().to_lowercase();
+    let matches: Vec<_> = validator_names.iter().filter(|(validator_name, _)| {
+        let validator_name = validator_name.to_lowercase();
+        match name.strip_suffix('*') {
+            Some(prefix) => validator_name.starts_with(prefix),
+            None => validator_name == name,
+        }
+    }).collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [(_, pk)] => Ok(Some(pk)),
+        _ => Err(matches),
+    }
+}
+
 #[tokio::main]
 async fn main() {
 
@@ -226,17 +265,39 @@ async fn main() {
         destination = decode_doublezero_info(dz_info).await.unwrap_or_else(|e| panic!("Failed to decode Doublezero API response: {}", e));
     }
 
+    let rpc_nodes = rpc_client.get_cluster_nodes().expect("Failed to get cluster nodes");
+    let rpc_pk_nodes = HashMap::<&str, &RpcContactInfo>::from_iter(rpc_nodes.iter().map(|n| (n.pubkey.as_str(), n)));
+
+    let mut errors = Errors(HashMap::new());
+
     let nodes_cnt = destination.len();
     let mut nodes_pk = Vec::new();
     let mut nodes_sa = Vec::new();
+    let mut nodes_name = Vec::new();
 
     for str in destination.into_iter() {
-        match str.parse::<SocketAddr>() {
-            Ok(sock_addr) => {
-                nodes_sa.push(sock_addr);
-            }
-            Err(_) => {
-                nodes_pk.push(str);
+        if let Ok(sock_addr) = str.parse::<SocketAddr>() {
+            nodes_sa.push(sock_addr);
+        } else if args.doublezero || str.parse::<Address>().is_ok() {
+            nodes_pk.push(str);
+        } else {
+            nodes_name.push(str);
+        }
+    }
+
+    if !nodes_name.is_empty() {
+        // Names are not unique among all the validators which ever published one, so only consider
+        // nodes of the cluster
+        let mut validator_names = get_validator_names(&rpc_client);
+        validator_names.retain(|(_, pk)| rpc_pk_nodes.contains_key(pk.as_str()));
+        for name in nodes_name {
+            match find_validator(&name, &validator_names) {
+                Ok(Some(pk)) => nodes_pk.push(pk.to_string()),
+                Ok(None) => errors.new(UnknownName, 0),
+                Err(matches) => {
+                    let matches: Vec<_> = matches.iter().map(|(name, pk)| format!("{} {}", pk, name)).collect();
+                    panic!("Several validators match name `{}`:\n{}", name, matches.join("\n"));
+                }
             }
         }
     }
@@ -244,12 +305,7 @@ async fn main() {
     let mut tpus: HashMap<SocketAddr, TPU> = HashMap::new();
     let mut total_stake = 0;
 
-    let mut errors = Errors(HashMap::new());
-
     let no_stake_weighting = nodes_cnt == 1 || args.no_stake_weighting;
-
-    let rpc_nodes = rpc_client.get_cluster_nodes().expect("Failed to get cluster nodes");
-    let rpc_pk_nodes = HashMap::<&str, &RpcContactInfo>::from_iter(rpc_nodes.iter().map(|n| (n.pubkey.as_str(), n)));
 
     // Stake of staked nodes, only needed for stake-weighting
     let stakes = (!no_stake_weighting).then(|| {
@@ -425,7 +481,7 @@ async fn main() {
     }
 
     for (error, (cnt, stk)) in &errors.0 {
-        if total_stake > 0 && *error != NotAStakedNode {
+        if total_stake > 0 && *error != NotAStakedNode && *error != UnknownName {
             println!("{}: {} ({:.2}% of total stake)", error, cnt, 100.0 * *stk as f64 / (total_stake as f64));
         } else {
             println!("{}: {}", error, cnt);

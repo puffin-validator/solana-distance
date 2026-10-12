@@ -7,8 +7,8 @@ use quinn::{Endpoint, VarInt};
 use rand::Rng;
 use solana_keypair::Keypair;
 use solana_rpc_client::rpc_client::RpcClient;
-use solana_rpc_client_types::response::{RpcContactInfo, RpcVoteAccountInfo};
-use std::collections::HashMap;
+use solana_rpc_client_types::response::RpcContactInfo;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
@@ -55,6 +55,7 @@ fn parse_count(s: &str) -> Result<usize, String> {
     }
 }
 
+#[derive(Default)]
 struct TPU {
     stake: u64,
     join: Option<JoinHandle<Vec<u32>>>,
@@ -245,155 +246,72 @@ async fn main() {
 
     let mut errors = Errors(HashMap::new());
 
-    let no_stake_weighting = if nodes_cnt == 1 {
-        true
-    } else {
-        args.no_stake_weighting
-    };
+    let no_stake_weighting = nodes_cnt == 1 || args.no_stake_weighting;
 
-    match (nodes_cnt == 0, no_stake_weighting) {
+    let rpc_nodes = rpc_client.get_cluster_nodes().expect("Failed to get cluster nodes");
+    let rpc_pk_nodes = HashMap::<&str, &RpcContactInfo>::from_iter(rpc_nodes.iter().map(|n| (n.pubkey.as_str(), n)));
 
-        (true, false) => {
-            let rpc_nodes = rpc_client.get_cluster_nodes().expect("Failed to get cluster nodes");
-            let rpc_nodes_hash = HashMap::<String, RpcContactInfo>::from_iter(rpc_nodes.into_iter().map(|n| (n.pubkey.clone(), n)));
-            let rpc_vote_accounts = rpc_client.get_vote_accounts().expect("Failed to get vote accounts").current;
-            for va in rpc_vote_accounts {
-                if va.activated_stake != 0 {
-                    total_stake += va.activated_stake;
-                    if let Some(ci) = rpc_nodes_hash.get(&va.node_pubkey) {
-                        if let Some(sock_addr) = ci.tpu_quic {
-                            let tpu = tpus.entry(sock_addr).or_insert(TPU {
-                                stake: 0,
-                                join: None,
-                                ids: vec![],
-                            });
-                            tpu.ids.push(va.node_pubkey.to_string());
-                            tpu.stake += va.activated_stake;
-                        } else {
-                            errors.new(NoTPU, va.activated_stake)
-                        }
-                    } else {
-                        errors.new(NoContactInfo, va.activated_stake)
-                    }
-                }
+    // Stake of staked nodes, only needed for stake-weighting
+    let stakes = (!no_stake_weighting).then(|| {
+        let mut stakes = HashMap::<String, u64>::new();
+        for va in rpc_client.get_vote_accounts().expect("Failed to get vote accounts").current {
+            if va.activated_stake != 0 {
+                *stakes.entry(va.node_pubkey).or_default() += va.activated_stake;
             }
         }
+        stakes
+    });
 
-        (true, true) => {
-            let rpc_nodes = rpc_client.get_cluster_nodes().expect("Failed to get cluster nodes");
-            for ci in rpc_nodes {
-                if let Some(sock_addr) = ci.tpu_quic {
-                    let tpu = tpus.entry(sock_addr).or_insert(TPU {
-                        stake: 0,
-                        join: None,
-                        ids: vec![],
-                    });
-                    tpu.ids.push(ci.pubkey.to_string());
-                } else {
-                    errors.new(NoTPU, 0)
-                }
-            }
+    // Identities of the nodes to measure. Using a set, a node specified several times is only counted once.
+    let mut ids = HashSet::<&str>::new();
+    if nodes_cnt == 0 {
+        match &stakes {
+            Some(stakes) => ids.extend(stakes.keys().map(String::as_str)),
+            None => ids.extend(rpc_nodes.iter().map(|n| n.pubkey.as_str())),
         }
-
-        (false, false) => {
-            let rpc_nodes = rpc_client.get_cluster_nodes().expect("Failed to get cluster nodes");
-            let rpc_vote_accounts = rpc_client.get_vote_accounts().expect("Failed to get vote accounts").current;
-            let rpc_pk_vote_accounts = HashMap::<String, &RpcVoteAccountInfo>::from_iter(rpc_vote_accounts.iter().map(|va| (va.node_pubkey.clone(), va)));
-            if !nodes_pk.is_empty() {
-                let rpc_pk_nodes = HashMap::<String, &RpcContactInfo>::from_iter(rpc_nodes.iter().map(|n| (n.pubkey.clone(), n)));
-                for pk in nodes_pk {
-                    if let Some(va) = rpc_pk_vote_accounts.get(&pk) {
-                        if let Some(ci) = rpc_pk_nodes.get(&pk) {
-                            if let Some(sock_addr) = ci.tpu_quic {
-                                let tpu = tpus.entry(sock_addr).or_insert(TPU {
-                                    stake: 0,
-                                    join: None,
-                                    ids: vec![],
-                                });
-                                tpu.ids.push(pk);
-                                tpu.stake += va.activated_stake;
-                                total_stake += va.activated_stake;
-                            } else {
-                                errors.new(NoTPU, va.activated_stake)
-                            }
-                        } else {
-                            errors.new(NoContactInfo, va.activated_stake);
-                        }
-                    } else {
-                        errors.new(NotAStakedNode, 0);
-                    }
-                }
-            }
-            if !nodes_sa.is_empty() {
-                let mut rpc_addr_nodes = HashMap::<SocketAddr, Vec<&RpcContactInfo>>::new();
-                for node in &rpc_nodes {
-                    if let Some(sock_addr) = node.tpu_quic {
-                        rpc_addr_nodes.entry(sock_addr).or_insert(vec![]).push(node);
-                    }
-                }
-                for sock_addr in nodes_sa {
-                    let tpu = tpus.entry(sock_addr).or_insert(TPU {
-                        stake: 0,
-                        join: None,
-                        ids: vec![],
-                    });
-                    for ci in rpc_addr_nodes.get(&sock_addr).unwrap() {
-                        if let Some(va) = rpc_pk_vote_accounts.get(&ci.pubkey) {
-                            tpu.ids.push(ci.pubkey.clone());
-                            tpu.stake += va.activated_stake;
-                            total_stake += va.activated_stake;
-                        }
-                    }
-                    if tpu.stake == 0 {
-                        errors.new(NotAStakedNode, 0);
-                        tpus.remove(&sock_addr);
-                    }
-                }
-            }
-        }
-
-        (false, true) => {
-            let rpc_nodes = rpc_client.get_cluster_nodes().expect("Failed to get cluster nodes");
-            if !nodes_pk.is_empty() {
-                let rpc_pk_nodes = HashMap::<String, &RpcContactInfo>::from_iter(rpc_nodes.iter().map(|n| (n.pubkey.clone(), n)));
-                for pk in nodes_pk {
-                    if let Some(ci) = rpc_pk_nodes.get(&pk) {
-                        if let Some(sock_addr) = ci.tpu_quic {
-                            let tpu = tpus.entry(sock_addr).or_insert(TPU {
-                                stake: 0,
-                                join: None,
-                                ids: vec![],
-                            });
-                            tpu.ids.push(pk);
-                        } else {
-                            errors.new(NoTPU, 0)
-                        }
-                    } else {
-                        errors.new(NoContactInfo, 0);
-                    }
-                }
-            }
-            if !nodes_sa.is_empty() {
-                let mut rpc_addr_nodes = HashMap::<SocketAddr, Vec<&RpcContactInfo>>::new();
-                for node in &rpc_nodes {
-                    if let Some(sock_addr) = node.tpu_quic {
-                        rpc_addr_nodes.entry(sock_addr).or_insert(vec![]).push(node);
-                    }
-                }
-                for sock_addr in nodes_sa {
-                    let tpu = tpus.entry(sock_addr).or_insert(TPU {
-                        stake: 0,
-                        join: None,
-                        ids: vec![],
-                    });
-                    for ci in rpc_addr_nodes.get(&sock_addr).unwrap() {
-                        tpu.ids.push(ci.pubkey.clone());
-                    }
-                }
-            }
+    }
+    ids.extend(nodes_pk.iter().map(String::as_str));
+    for sock_addr in nodes_sa {
+        // A TPU address stands for the nodes using it, limited to staked ones in case of stake-weighting
+        let mut addr_ids = rpc_nodes.iter()
+            .filter(|n| n.tpu_quic == Some(sock_addr))
+            .map(|n| n.pubkey.as_str())
+            .filter(|&pk| stakes.as_ref().is_none_or(|stakes| stakes.contains_key(pk)))
+            .peekable();
+        if addr_ids.peek().is_some() {
+            ids.extend(addr_ids);
+        } else if stakes.is_some() {
+            errors.new(NotAStakedNode, 0);
+        } else {
+            // No known node uses this address, measure it anyway
+            tpus.entry(sock_addr).or_default();
         }
     }
 
+    for pk in ids {
+        let stake = match &stakes {
+            Some(stakes) => {
+                let Some(&stake) = stakes.get(pk) else {
+                    errors.new(NotAStakedNode, 0);
+                    continue;
+                };
+                stake
+            }
+            None => 0,
+        };
+        total_stake += stake;
+        let Some(ci) = rpc_pk_nodes.get(pk) else {
+            errors.new(NoContactInfo, stake);
+            continue;
+        };
+        let Some(sock_addr) = ci.tpu_quic else {
+            errors.new(NoTPU, stake);
+            continue;
+        };
+        let tpu = tpus.entry(sock_addr).or_default();
+        tpu.ids.push(pk.to_string());
+        tpu.stake += stake;
+    }
 
     let endpoint = new_quic_endpoint(&Keypair::new(), args.source_port).await;
 

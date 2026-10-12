@@ -51,4 +51,4 @@ Option `--doublezero` limits the measure to validators connected to Doublezero a
 
 For a full list of available options, use the `--help` flag.
 
-WARNING: never use a count higher than 80, and avoid repeating the command during a short period, or you will hit Agave rate limit on QUIC incoming connections (bucket of 80 tokens, per source IP, refilled at a pace of 1 token every 7.5 s).
+WARNING: counts higher than 80 are refused, and you should avoid repeating the command during a short period, or you will hit Agave rate limit on QUIC incoming connections (bucket of 80 tokens, per source IP, refilled at a pace of 1 token every 7.5 s).

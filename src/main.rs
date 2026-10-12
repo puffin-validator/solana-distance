@@ -34,7 +34,7 @@ struct Args {
     file: Option<PathBuf>,
     #[arg(short='s', long, help = "If specified, disable the stake-weighting of the average distance")]
     no_stake_weighting: bool,
-    #[arg(short, long, default_value_t = 5, help = "Number of connection attempts, one attempt is performed every 0,8 secs")]
+    #[arg(short, long, default_value_t = 5, value_parser = parse_count, help = "Number of connection attempts, between 1 and 80, one attempt is performed every 0,8 secs")]
     count: usize,
     #[arg(short, long, help = "URL of the RPC where cluster info is fetched from", default_value="https://api.mainnet-beta.solana.com")]
     rpc: String,
@@ -42,6 +42,17 @@ struct Args {
     doublezero: bool,
     #[arg(short='p', long, default_value_t = DEFAULT_SOURCE_PORT, help = "Local UDP port connections are made from, 0 to let the system pick a random one")]
     source_port: u16,
+}
+
+// Agave limits the rate of incoming QUIC connections per source IP with a bucket of 80 tokens,
+// refilled at a pace of 1 token every 7.5 s.
+const MAX_COUNT: usize = 80;
+
+fn parse_count(s: &str) -> Result<usize, String> {
+    match s.parse() {
+        Ok(count) if (1..=MAX_COUNT).contains(&count) => Ok(count),
+        _ => Err(format!("count must be between 1 and {}", MAX_COUNT)),
+    }
 }
 
 struct TPU {

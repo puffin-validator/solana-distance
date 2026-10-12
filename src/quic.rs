@@ -2,7 +2,8 @@ use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use quinn::{ClientConfig, Endpoint, TransportConfig};
+use socket2::{Domain, Protocol, Socket, Type};
+use quinn::{ClientConfig, Endpoint, EndpointConfig, TokioRuntime, TransportConfig};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -14,6 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu"; // Application protocol transported by TLS
 pub const QUIC_KEEP_ALIVE: Duration = Duration::from_millis(1000);
 pub const QUIC_MAX_TIMEOUT: Duration = Duration::from_millis(20000);
+const RECV_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
 pub fn socket_addr_to_quic_server_name(peer: SocketAddr) -> String {
     format!("{}.{}.sol", peer.ip(), peer.port())
@@ -61,9 +63,14 @@ pub async fn new_quic_endpoint(keypair: &Keypair, client_port: u16) -> Endpoint 
     transport_config.send_fairness(false);
     config.transport_config(Arc::new(transport_config));
 
-    // Local address
+    // Local socket
     let client_addr = SocketAddr::from(([0, 0, 0, 0], client_port));
-    let mut endpoint = Endpoint::client(client_addr).unwrap_or_else(|e| panic!("Cannot bind UDP port {}: {}. Use option --source-port to select another port", client_port, e));
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("Cannot create socket");
+    // A large receive buffer absorbs bursts of responses when connecting to many nodes.
+    // The system may grant less than requested, which is not an error.
+    let _ = socket.set_recv_buffer_size(RECV_BUFFER_SIZE);
+    socket.bind(&client_addr.into()).unwrap_or_else(|e| panic!("Cannot bind UDP port {}: {}. Use option --source-port to select another port", client_port, e));
+    let mut endpoint = Endpoint::new(EndpointConfig::default(), None, socket.into(), Arc::new(TokioRuntime)).expect("Cannot create endpoint");
     endpoint.set_default_client_config(config);
     endpoint
 }

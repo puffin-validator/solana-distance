@@ -34,7 +34,7 @@ struct Args {
     file: Option<PathBuf>,
     #[arg(short='s', long, help = "If specified, disable the stake-weighting of the average distance")]
     no_stake_weighting: bool,
-    #[arg(short, long, default_value_t = 5, value_parser = parse_count, help = "Number of connection attempts, between 1 and 80, one attempt is performed every 0,8 secs")]
+    #[arg(short, long, default_value_t = 5, value_parser = parse_count, help = "Number of connection attempts, between 1 and 80, one attempt is performed every 0,8 secs, or more when there are more than 400 TPUs to connect to")]
     count: usize,
     #[arg(short, long, help = "URL of the RPC where cluster info is fetched from", default_value="https://api.mainnet-beta.solana.com")]
     rpc: String,
@@ -106,24 +106,27 @@ impl Display for Error {
 const DEFAULT_SOURCE_PORT: u16 = 20488;
 
 const LEADER_WINDOW: Duration = Duration::from_millis(4 * 200); // 4 slots
+// Maximum rate of connections per second, all TPUs included. Above some rate, responses arrive faster
+// than they can be processed, they are dropped by the system and measures are wrong.
+const MAX_CONNECTION_RATE: f64 = 500.0;
 const CONNECTION_TIMEOUT: Duration = Duration::from_millis(1600); // Quinn retransmission fires after 1s, so we need the timeout to be greater than 1s + highest RTT
 
 /// Return the sorted latencies of successful connections.
 ///
-/// Send `count` connection requests, spaced 4 slots apart, to give a good chance that at least one request
-/// doesn't arrive when the validator is busy being leader.
+/// Send `count` connection requests, spaced `interval` apart, which is at least 4 slots to give a good chance
+/// that at least one request doesn't arrive when the validator is busy being leader.
 /// Add a random temporization if requested.
-async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> Vec<u32> {
+async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, interval: Duration, temporization: bool) -> Vec<u32> {
     let server_name = socket_addr_to_quic_server_name(tpu_quic);
     if temporization {
-        let delay= rand::rng().random_range(Duration::ZERO..LEADER_WINDOW);
+        let delay= rand::rng().random_range(Duration::ZERO..interval);
         sleep(delay).await;
     }
     let mut t = Instant::now();
     let mut lats = Vec::with_capacity(count);
     lats.extend(ping(&endpoint, &server_name, tpu_quic).await);
     for _ in 1..count {
-        t = t.add(LEADER_WINDOW).max(Instant::now());
+        t = t.add(interval).max(Instant::now());
         sleep_until(t).await;
         lats.extend(ping(&endpoint, &server_name, tpu_quic).await);
     }
@@ -378,8 +381,10 @@ async fn main() {
     let endpoint = new_quic_endpoint(&Keypair::new(), args.source_port).await;
 
     let temporization = tpus.len() > 1;
+    // Connections to a TPU are spaced further apart when there are many TPUs, to limit the global rate of connections
+    let interval = LEADER_WINDOW.max(Duration::from_secs_f64(tpus.len() as f64 / MAX_CONNECTION_RATE));
     for (sock_addr, tpu) in &mut tpus {
-        tpu.join = Some(tokio::spawn(latency(endpoint.clone(), *sock_addr, args.count, temporization)));
+        tpu.join = Some(tokio::spawn(latency(endpoint.clone(), *sock_addr, args.count, interval, temporization)));
     }
 
     let mut lat_sum_w = 0.0;

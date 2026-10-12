@@ -2856,6 +2856,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde_json",
+ "socket2",
  "solana-keypair",
  "solana-rpc-client",
  "solana-rpc-client-types",

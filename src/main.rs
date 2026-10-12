@@ -451,7 +451,7 @@ async fn main() {
         } else {
             println!("Simple distance: {:.0} µs", lat_sum / lat_cnt as f64);
         }
-        if total_stake > 0 {
+        if lat_stk > 0 {
             if args.count > 1 {
                 println!("Stake-weighted distance: {:.0} ± {:.0} µs", lat_sum_w / lat_stk as f64, var_sum_w.sqrt() / lat_stk as f64);
             } else {

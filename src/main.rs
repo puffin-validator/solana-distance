@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::ops::Add;
 use std::path::PathBuf;
 use std::time::Duration;
-use reqwest::blocking::Response;
+use reqwest::Response;
 use serde_json::Value;
 use tokio::fs::File;
 use tokio::io;
@@ -147,8 +147,8 @@ async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -
     }
 }
 
-fn decode_doublezero_info(dz_info: Response) -> Result<Vec<String>, &'static str> {
-    let Ok(j) = dz_info.json::<Value>() else { return Err("Invalid JSON") };
+async fn decode_doublezero_info(dz_info: Response) -> Result<Vec<String>, &'static str> {
+    let Ok(j) = dz_info.json::<Value>().await else { return Err("Invalid JSON") };
     let Some(j) = j.as_object() else { return Err("Not an object") };
     if j.get("success") != Some(&Value::Bool(true)) { return Err("Failed") };
     let Some(j) = j.get("data") else { return Err("No data") };
@@ -188,8 +188,8 @@ async fn main() {
             panic!("Only one Doublezero network name can be specified");
         }
         let url = format!("https://doublezero.xyz/api/dz-validators?network={}", network);
-        let dz_info = reqwest::blocking::get(&url).expect("Cannot send request to Doublezero API");
-        destination = decode_doublezero_info(dz_info).unwrap_or_else(|e| panic!("Failed to decode Doublezero API response: {}", e));
+        let dz_info = reqwest::get(&url).await.expect("Cannot send request to Doublezero API");
+        destination = decode_doublezero_info(dz_info).await.unwrap_or_else(|e| panic!("Failed to decode Doublezero API response: {}", e));
     }
 
     let nodes_cnt = destination.len();

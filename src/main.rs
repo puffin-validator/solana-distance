@@ -186,20 +186,14 @@ async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -
 
 async fn decode_doublezero_info(dz_info: Response) -> Result<Vec<String>, &'static str> {
     let Ok(j) = dz_info.json::<Value>().await else { return Err("Invalid JSON") };
-    let Some(j) = j.as_object() else { return Err("Not an object") };
-    if j.get("success") != Some(&Value::Bool(true)) { return Err("Failed") };
-    let Some(j) = j.get("data") else { return Err("No data") };
-    let Some(j) = j.as_object() else { return Err("data is not an object") };
-    let Some(j) = j.get("validators") else { return Err("No validators") };
-    let Some(j) = j.as_array() else { return Err("validators is not an array") };
-    let mut res = Vec::new();
-    for v in j {
-        let Some(j) = v.as_object() else { return Err("validators is not an array of objects") };
-        let Some(j) = j.get("account") else { return Err("validator has no account") };
-        res.push(j.as_str().unwrap().to_string());
-    }
-    if res.is_empty() { return Err("No validators") };
-    Ok(res)
+    if j["success"] != true { return Err("Failed") };
+    let Some(validators) = j["data"]["validators"].as_array() else { return Err("No validators") };
+    let accounts = validators.iter()
+        .map(|validator| validator["account"].as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("Validator without account")?;
+    if accounts.is_empty() { return Err("No validators") };
+    Ok(accounts)
 }
 
 const CONFIG_PROGRAM_ID: &str = "Config1111111111111111111111111111111111111";

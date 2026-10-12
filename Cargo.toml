@@ -2,6 +2,7 @@
 name = "solana-distance"
 edition = "2021"
 version = "1.1.0"
+rust-version = "1.89"
 
 [dependencies]
 solana-rpc-client = "3.0.6"

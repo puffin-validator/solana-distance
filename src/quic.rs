@@ -63,7 +63,7 @@ pub async fn new_quic_endpoint(keypair: &Keypair, client_port: u16) -> Endpoint 
 
     // Local address
     let client_addr = SocketAddr::from(([0, 0, 0, 0], client_port));
-    let mut endpoint = Endpoint::client(client_addr).expect("Cannot create endpoint");
+    let mut endpoint = Endpoint::client(client_addr).unwrap_or_else(|e| panic!("Cannot bind UDP port {}: {}. Use option --source-port to select another port", client_port, e));
     endpoint.set_default_client_config(config);
     endpoint
 }

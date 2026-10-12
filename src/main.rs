@@ -40,6 +40,8 @@ struct Args {
     rpc: String,
     #[arg(short='2', long, help = "Measure the distance to the a Doublezero network passed as an optional argument [default: mainnet]")]
     doublezero: bool,
+    #[arg(short='p', long, default_value_t = DEFAULT_SOURCE_PORT, help = "Local UDP port connections are made from, 0 to let the system pick a random one")]
+    source_port: u16,
 }
 
 struct TPU {
@@ -81,6 +83,11 @@ impl Display for Error {
         }
     }
 }
+
+// The path followed by packets, and so the latency, depends on the source port (multipath routing).
+// Using a fixed port by default makes successive measures comparable.
+// The value is arbitrary, outside of the default port range of validators and of the range of ephemeral ports.
+const DEFAULT_SOURCE_PORT: u16 = 20488;
 
 const LEADER_WINDOW: Duration = Duration::from_millis(4 * 200); // 4 slots
 const CONNECTION_TIMEOUT: Duration = Duration::from_millis(1600); // Quinn retransmission fires after 1s, so we need the timeout to be greater than 1s + highest RTT
@@ -366,7 +373,7 @@ async fn main() {
     }
 
 
-    let endpoint = new_quic_endpoint(&Keypair::new(), 0).await;
+    let endpoint = new_quic_endpoint(&Keypair::new(), args.source_port).await;
 
     let temporization = tpus.len() > 1;
     for (sock_addr, tpu) in &mut tpus {

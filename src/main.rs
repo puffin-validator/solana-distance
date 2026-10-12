@@ -31,7 +31,7 @@ struct Args {
     destination: Vec<String>,
     #[arg(short, long, help = "Print details for each validator we are connecting to")]
     details: bool,
-    #[arg(short, long, help = "Path to a file containing a list of validator pubkey, name or ip:port")]
+    #[arg(short, long, conflicts_with = "doublezero", help = "Path to a file containing a list of validator pubkey, name or ip:port, one per line")]
     file: Option<PathBuf>,
     #[arg(short='s', long, help = "If specified, disable the stake-weighting of the average distance")]
     no_stake_weighting: bool,
@@ -245,7 +245,10 @@ async fn main() {
         let file = File::open(path).await.expect("Failed to open specified file");
         let mut lines = io::BufReader::new(file).lines();
         while let Some(line) = lines.next_line().await.expect("Failed to read specified file") {
-            destination.push(line);
+            let line = line.trim();
+            if !line.is_empty() {
+                destination.push(line.to_string());
+            }
         }
     }
 

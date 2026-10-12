@@ -44,7 +44,7 @@ struct Args {
 
 struct TPU {
     stake: u64,
-    join: Option<JoinHandle<(u32, u64)>>,
+    join: Option<JoinHandle<Option<(f64, Option<f64>)>>>,
     ids: Vec<String>,
 }
 
@@ -85,7 +85,8 @@ impl Display for Error {
 const LEADER_WINDOW: Duration = Duration::from_millis(4 * 400); // 4 slots
 const CONNECTION_TIMEOUT: Duration = LEADER_WINDOW;
 
-/// Return latency estimate and its variance.
+/// Return latency estimate and its variance, or `None` if no connection succeeded.
+/// The variance is `None` if only one connection succeeded.
 ///
 /// Send `count` connection requests, spaced 4 slots apart, to give a good chance that at least one request
 /// doesn't arrive when the validator is busy being leader.
@@ -93,57 +94,60 @@ const CONNECTION_TIMEOUT: Duration = LEADER_WINDOW;
 ///
 /// We collect latencies and assume they follow a 2-parameter exponential distribution:
 /// p(x) = 1/b exp(-(x-a)/b)
-/// Parameters are estimated using unbiased MLE:
+/// To be robust against outliers (e.g. the validator being busy), only the r = ceil(n/2) lowest of the
+/// n latencies are used (at least 2), the others being treated as censored (type II censoring): all we
+/// retain from them is that they are not lower than the highest latency kept.
+/// With x(1) <= ... <= x(n) the sorted latencies, the unbiased estimators are:
+/// b = (x(1) + ... + x(r) + (n-r)*x(r) - n*x(1)) / (r-1)
+/// a = x(1) - b/n
+/// var(a) = b^2 / n^2
+/// With r = n, these are the usual unbiased estimators for the complete sample:
 /// https://www.researchgate.net/publication/233060006_Estimation_in_two-parameter_exponential_distributions
-/// a = (n*min(x) - mean(x))/(n-1)
-/// b = n*(mean(x) - min(x))/(n-1)
-/// var(a) = b^2 / (n(n-1))
-async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> (u32, u64) {
+/// Note that `a` can be negative when the latencies are widely spread compared to the lowest one.
+async fn latency(endpoint: Endpoint, tpu_quic: SocketAddr, count: usize, temporization: bool) -> Option<(f64, Option<f64>)> {
     let server_name = socket_addr_to_quic_server_name(tpu_quic);
     if temporization {
         let delay= rand::rng().random_range(Duration::ZERO..LEADER_WINDOW);
         sleep(delay).await;
     }
     let mut t = tokio::time::Instant::now();
-    let mut lat_min = ping(&endpoint, &server_name, tpu_quic).await;
-    let mut lat_sum;
-    let mut lat_cnt;
-    if lat_min == u32::MAX {
-        lat_cnt = 0;
-        lat_sum = 0;
-    } else {
-        lat_cnt = 1;
-        lat_sum = lat_min as u64;
-    }
+    let mut lats = Vec::with_capacity(count);
+    lats.extend(ping(&endpoint, &server_name, tpu_quic).await);
     for _ in 1..count {
         t = t.add(LEADER_WINDOW);
         sleep_until(t).await;
-        let lat = ping(&endpoint, &server_name, tpu_quic).await;
-        if lat != u32::MAX {
-            lat_min = lat_min.min(lat);
-            lat_sum += lat as u64;
-            lat_cnt += 1;
-        }
+        lats.extend(ping(&endpoint, &server_name, tpu_quic).await);
     }
-    if lat_cnt < 2 {
-        (lat_min, u64::MAX)
-    } else {
-        let lat_mean = lat_sum / lat_cnt;
-        let a = ((lat_cnt * lat_min as u64).saturating_sub(lat_mean)) / (lat_cnt - 1);
-        let b = (lat_cnt * (lat_mean - lat_min as u64)) / (lat_cnt - 1);
-        (a.try_into().expect("rtt overflow"), (b*b)/(lat_cnt*(lat_cnt-1)))
-    }
+    lats.sort_unstable();
+    estimate_latency(&lats)
 }
 
-async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -> u32 {
+/// Estimate the latency and its variance from sorted latencies, see `latency`.
+fn estimate_latency(lats: &[u32]) -> Option<(f64, Option<f64>)> {
+    let n = lats.len();
+    if n < 2 {
+        return lats.first().map(|&lat| (lat as f64, None));
+    }
+    let r = n.div_ceil(2).max(2);
+    let lat_min = lats[0] as u64;
+    let lat_max = lats[r - 1] as u64;
+    let lat_sum: u64 = lats[..r].iter().map(|&lat| lat as u64).sum();
+    // Sum of the excesses over the minimum, censored latencies counting as `lat_max`
+    let excess = lat_sum + (n - r) as u64 * lat_max - n as u64 * lat_min;
+    let b = excess as f64 / (r - 1) as f64;
+    let a = lat_min as f64 - b / n as f64;
+    Some((a, Some((b * b) / (n * n) as f64)))
+}
+
+async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -> Option<u32> {
     let connecting = endpoint.connect(tpu_quic, server_name).expect("Connection configuration error");
     if let Ok(Ok(connection)) = timeout(CONNECTION_TIMEOUT, connecting).await {
         // With a timeout of 2 s, rtt in µs should never overflow u32.
         let rtt: u32 = connection.rtt().as_micros().try_into().expect("rtt overflow");
         connection.close(VarInt::default(), &[]);
-        rtt/2
+        Some(rtt/2)
     } else {
-        u32::MAX
+        None
     }
 }
 
@@ -369,13 +373,13 @@ async fn main() {
         tpu.join = Some(tokio::spawn(latency(endpoint.clone(), *sock_addr, args.count, temporization)));
     }
 
-    let mut lat_sum_w = 0;
-    let mut lat_sum = 0;
+    let mut lat_sum_w = 0.0;
+    let mut lat_sum = 0.0;
     let mut lat_cnt = 0;
     let mut lat_stk = 0;
 
-    let mut var_sum_w = 0;
-    let mut var_sum = 0;
+    let mut var_sum_w = 0.0;
+    let mut var_sum = 0.0;
 
     for (sock_addr, tpu) in tpus {
         match tpu.join {
@@ -388,37 +392,38 @@ async fn main() {
                     }
                 }
                 match join.await {
-                    Ok((u32::MAX, _)) => {
+                    Ok(None) => {
                         errors.new_and_print_if(ConnectionFailed, tpu.stake, args.details);
                     }
-                    Ok((lat, u64::MAX)) => {
+                    Ok(Some((lat, None))) => {
                         // Ignore this measure if args.count > 1 since we won't be able to
                         // compute global variance
                         if args.count == 1 {
                             if total_stake > 0 {
-                                lat_sum_w += lat as u128 * tpu.stake as u128;
+                                lat_sum_w += lat * tpu.stake as f64;
                                 lat_stk += tpu.stake;
                             }
-                            lat_sum += lat as u64;
+                            lat_sum += lat;
                             lat_cnt += 1;
                             if args.details {
-                                println!("{} µs", lat);
+                                println!("{:.0} µs", lat);
                             }
                         } else {
                             errors.new_and_print_if(OnlyOneSuccessfulConnection, tpu.stake, args.details);
                         }
                     }
-                    Ok((lat, var)) => {
+                    Ok(Some((lat, Some(var)))) => {
                         if total_stake > 0 {
-                            lat_sum_w += lat as u128 * tpu.stake as u128;
+                            lat_sum_w += lat * tpu.stake as f64;
                             lat_stk += tpu.stake;
-                            var_sum_w += var as u128 * tpu.stake as u128;
+                            var_sum_w += var * tpu.stake as f64;
                         }
-                        lat_sum += lat as u64;
+                        lat_sum += lat;
                         lat_cnt += 1;
-                        var_sum += var as u128;
+                        var_sum += var;
                         if args.details {
-                            println!("{} ± {} µs", lat, var.isqrt());
+                            // The estimate can be slightly negative, a latency cannot
+                            println!("{:.0} ± {:.0} µs", lat.max(0.0), var.sqrt());
                         }
                     }
                     Err(_) => {
@@ -433,15 +438,15 @@ async fn main() {
 
     if lat_cnt > 0 {
         if args.count > 1 {
-            println!("Simple distance: {} ± {} µs", lat_sum / lat_cnt as u64, (var_sum / lat_cnt).isqrt());
+            println!("Simple distance: {:.0} ± {:.0} µs", lat_sum / lat_cnt as f64, (var_sum / lat_cnt as f64).sqrt());
         } else {
-            println!("Simple distance: {} µs", lat_sum / lat_cnt as u64);
+            println!("Simple distance: {:.0} µs", lat_sum / lat_cnt as f64);
         }
         if total_stake > 0 {
             if args.count > 1 {
-                println!("Stake-weighted distance: {} ± {} µs", lat_sum_w / lat_stk as u128, (var_sum_w / lat_stk as u128).isqrt());
+                println!("Stake-weighted distance: {:.0} ± {:.0} µs", lat_sum_w / lat_stk as f64, (var_sum_w / lat_stk as f64).sqrt());
             } else {
-                println!("Stake-weighted distance: {} µs", lat_sum_w / lat_stk as u128);
+                println!("Stake-weighted distance: {:.0} µs", lat_sum_w / lat_stk as f64);
             }
             println!("Total stake: {} SOL", lat_stk / 1_000_000_000);
         }

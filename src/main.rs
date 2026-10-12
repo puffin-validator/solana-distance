@@ -34,7 +34,7 @@ struct Args {
     file: Option<PathBuf>,
     #[arg(short='s', long, help = "If specified, disable the stake-weighting of the average distance")]
     no_stake_weighting: bool,
-    #[arg(short, long, default_value_t = 5, help = "Number of connection attempts, one attempt is performed every 1,8 secs")]
+    #[arg(short, long, default_value_t = 5, help = "Number of connection attempts, one attempt is performed every 0,8 secs")]
     count: usize,
     #[arg(short, long, help = "URL of the RPC where cluster info is fetched from", default_value="https://api.mainnet-beta.solana.com")]
     rpc: String,
@@ -82,8 +82,8 @@ impl Display for Error {
     }
 }
 
-const LEADER_WINDOW: Duration = Duration::from_millis(4 * 400); // 4 slots
-const CONNECTION_TIMEOUT: Duration = LEADER_WINDOW;
+const LEADER_WINDOW: Duration = Duration::from_millis(4 * 200); // 4 slots
+const CONNECTION_TIMEOUT: Duration = Duration::from_millis(1600); // Quinn retransmission fires after 1s, so we need the timeout to be greater than 1s + highest RTT
 
 /// Return latency estimate and its variance, or `None` if no connection succeeded.
 /// The variance is `None` if only one connection succeeded.

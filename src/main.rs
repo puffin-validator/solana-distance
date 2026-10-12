@@ -1,7 +1,6 @@
 mod quic;
 
 use crate::quic::{new_quic_endpoint, socket_addr_to_quic_server_name};
-use crate::Error::{ConnectionError, ConnectionFailed, NoContactInfo, NoTPU, NotAStakedNode, OnlyOneSuccessfulConnection, UnknownName};
 use clap::Parser;
 use quinn::{Endpoint, VarInt};
 use rand::Rng;
@@ -71,6 +70,7 @@ enum Error {
     NoContactInfo,
     NoTPU,
     NotAStakedNode,
+    UnknownAddress,
     UnknownName,
 }
 struct Errors(HashMap<Error, (u64, u64)>);
@@ -88,20 +88,21 @@ impl Errors {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            ConnectionError => write!(f, "Connection error"),
-            ConnectionFailed => write!(f, "No successful connection"),
-            OnlyOneSuccessfulConnection => write!(f, "Only one successful connection"),
-            NoContactInfo => write!(f, "No contact info"),
-            NoTPU => write!(f, "No TPU"),
-            NotAStakedNode => write!(f, "Not a staked node"),
-            UnknownName => write!(f, "Unknown name"),
+            Error::ConnectionError => write!(f, "Connection error"),
+            Error::ConnectionFailed => write!(f, "No successful connection"),
+            Error::OnlyOneSuccessfulConnection => write!(f, "Only one successful connection"),
+            Error::NoContactInfo => write!(f, "No contact info"),
+            Error::NoTPU => write!(f, "No TPU"),
+            Error::NotAStakedNode => write!(f, "Not a staked node"),
+            Error::UnknownAddress => write!(f, "Unknown address"),
+            Error::UnknownName => write!(f, "Unknown name"),
         }
     }
 }
 
 // The path followed by packets, and so the latency, depends on the source port (multipath routing).
 // Using a fixed port by default makes successive measures comparable.
-// The value is arbitrary, outside of the default port range of validators and of the range of ephemeral ports.
+// The value is arbitrary, outside the default port range of validators and of the range of ephemeral ports.
 const DEFAULT_SOURCE_PORT: u16 = 20488;
 
 const LEADER_WINDOW: Duration = Duration::from_millis(4 * 200); // 4 slots
@@ -175,7 +176,7 @@ fn weighted_median(sorted: &[(u32, u32)], weight: impl Fn(u32) -> f64) -> Option
 async fn ping(endpoint: &Endpoint, server_name: &String, tpu_quic: SocketAddr) -> Option<u32> {
     let connecting = endpoint.connect(tpu_quic, server_name).expect("Connection configuration error");
     if let Ok(Ok(connection)) = timeout(CONNECTION_TIMEOUT, connecting).await {
-        // With a timeout of 2 s, rtt in µs should never overflow u32.
+        // With a timeout of 1.6 s, rtt in µs should never overflow u32.
         let rtt: u32 = connection.rtt().as_micros().try_into().expect("rtt overflow");
         connection.close(VarInt::default(), &[]);
         Some(rtt/2)
@@ -283,14 +284,14 @@ async fn main() {
     }
 
     if !nodes_name.is_empty() {
-        // Names are not unique among all the validators which ever published one, so only consider
+        // Names are not unique among all the validators whichever published one, so only consider
         // nodes of the cluster
         let mut validator_names = get_validator_names(&rpc_client);
         validator_names.retain(|(_, pk)| rpc_pk_nodes.contains_key(pk.as_str()));
         for name in nodes_name {
             match find_validator(&name, &validator_names) {
                 Ok(Some(pk)) => nodes_pk.push(pk.to_string()),
-                Ok(None) => errors.new(UnknownName, 0),
+                Ok(None) => errors.new(Error::UnknownName, 0),
                 Err(matches) => {
                     let matches: Vec<_> = matches.iter().map(|(name, pk)| format!("{} {}", pk, name)).collect();
                     panic!("Several validators match name `{}`:\n{}", name, matches.join("\n"));
@@ -329,15 +330,23 @@ async fn main() {
         let mut addr_ids = rpc_nodes.iter()
             .filter(|n| n.tpu_quic == Some(sock_addr))
             .map(|n| n.pubkey.as_str())
+            .peekable();
+        if addr_ids.peek().is_none() {
+            if stakes.is_some() {
+                errors.new(Error::UnknownAddress, 0);
+            } else {
+                // No known node uses this address, measure it anyway
+                tpus.entry(sock_addr).or_default();
+            }
+            continue;
+        }
+        let mut addr_ids = addr_ids
             .filter(|&pk| stakes.as_ref().is_none_or(|stakes| stakes.contains_key(pk)))
             .peekable();
         if addr_ids.peek().is_some() {
             ids.extend(addr_ids);
-        } else if stakes.is_some() {
-            errors.new(NotAStakedNode, 0);
         } else {
-            // No known node uses this address, measure it anyway
-            tpus.entry(sock_addr).or_default();
+            errors.new(Error::NotAStakedNode, 0);
         }
     }
 
@@ -345,7 +354,7 @@ async fn main() {
         let stake = match &stakes {
             Some(stakes) => {
                 let Some(&stake) = stakes.get(pk) else {
-                    errors.new(NotAStakedNode, 0);
+                    errors.new(Error::NotAStakedNode, 0);
                     continue;
                 };
                 stake
@@ -354,11 +363,11 @@ async fn main() {
         };
         total_stake += stake;
         let Some(ci) = rpc_pk_nodes.get(pk) else {
-            errors.new(NoContactInfo, stake);
+            errors.new(Error::NoContactInfo, stake);
             continue;
         };
         let Some(sock_addr) = ci.tpu_quic else {
-            errors.new(NoTPU, stake);
+            errors.new(Error::NoTPU, stake);
             continue;
         };
         let tpu = tpus.entry(sock_addr).or_default();
@@ -402,7 +411,7 @@ async fn main() {
                 }
                 match join.await.map(|lats| (estimate_latency(&lats), lats)) {
                     Ok((None, _)) => {
-                        errors.new_and_print_if(ConnectionFailed, tpu.stake, args.details);
+                        errors.new_and_print_if(Error::ConnectionFailed, tpu.stake, args.details);
                     }
                     Ok((Some((lat, None)), _)) => {
                         // Ignore this measure if args.count > 1 since we won't be able to
@@ -418,7 +427,7 @@ async fn main() {
                                 println!("{:.0} µs", lat);
                             }
                         } else {
-                            errors.new_and_print_if(OnlyOneSuccessfulConnection, tpu.stake, args.details);
+                            errors.new_and_print_if(Error::OnlyOneSuccessfulConnection, tpu.stake, args.details);
                         }
                     }
                     Ok((Some((lat, Some(var))), lats)) => {
@@ -443,7 +452,7 @@ async fn main() {
                         }
                     }
                     Err(_) => {
-                        errors.new_and_print_if(ConnectionError, tpu.stake, args.details);
+                        errors.new_and_print_if(Error::ConnectionError, tpu.stake, args.details);
                     }
                 }
             }
@@ -478,7 +487,7 @@ async fn main() {
     }
 
     for (error, (cnt, stk)) in &errors.0 {
-        if total_stake > 0 && *error != NotAStakedNode && *error != UnknownName {
+        if total_stake > 0 && ![Error::NotAStakedNode, Error::UnknownAddress, Error::UnknownName].contains(error) {
             println!("{}: {} ({:.2}% of total stake)", error, cnt, 100.0 * *stk as f64 / (total_stake as f64));
         } else {
             println!("{}: {}", error, cnt);
